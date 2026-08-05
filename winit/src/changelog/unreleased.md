@@ -62,6 +62,8 @@ changelog entry.
   applications can ignore activation clicks for buttons or destructive actions while accepting
   them for low-risk actions like selection or scrolling. Always `false` on other platforms.
 - `winit::event_loop::EventLoopProvider` trait with common event loop methods.
+- Add `ActiveEventLoop::clipboard_data_transfer` and `ActiveEventLoop::set_clipboard` for reading
+  and writing the system clipboard through the data transfer API, implemented on Wayland.
 
 ### Changed
 

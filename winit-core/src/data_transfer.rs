@@ -1,7 +1,9 @@
 //! Cross-platform abstractions related to data transfer (i.e. clipboard and drag-and-drop).
 //!
-//! > **NOTE**: Interacting with the clipboard is currently not implemented in Winit, and
-//! > this API is only used for drag-and-drop.
+//! > **NOTE**: Interacting with the clipboard is currently only implemented on Wayland, see
+//! > [`clipboard_data_transfer`](crate::event_loop::ActiveEventLoop::clipboard_data_transfer)
+//! > and [`set_clipboard`](crate::event_loop::ActiveEventLoop::set_clipboard). On other
+//! > platforms this API is only used for drag-and-drop.
 //!
 //! # Quickstart
 //!

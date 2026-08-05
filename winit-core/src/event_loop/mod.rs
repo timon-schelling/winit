@@ -329,6 +329,40 @@ pub trait ActiveEventLoop: AsAny + fmt::Debug {
             DATA_TRANSFER_UNSUPPORTED_ERROR_MESSAGE,
         )))
     }
+
+    /// Get the current clipboard contents as a [data transfer](crate::data_transfer).
+    ///
+    /// The returned ID can be used with [`data_transfer`](Self::data_transfer) to inspect the
+    /// available types, and with [`fetch_data_transfer`](Self::fetch_data_transfer) to read the
+    /// data, which is delivered with the
+    /// [`DataTransferReceived`](crate::event::WindowEvent::DataTransferReceived) event. As the
+    /// clipboard is not tied to a particular window, that event may be dispatched to all windows;
+    /// use the [`AsyncRequestSerial`] returned by
+    /// [`fetch_data_transfer`](Self::fetch_data_transfer) to identify it.
+    ///
+    /// The ID is only valid until the clipboard contents change.
+    ///
+    /// Returns [`RequestError::Ignored`] if the clipboard is currently empty.
+    fn clipboard_data_transfer(&self) -> Result<DataTransferId, RequestError> {
+        Err(RequestError::NotSupported(NotSupportedError::new(
+            DATA_TRANSFER_UNSUPPORTED_ERROR_MESSAGE,
+        )))
+    }
+
+    /// Set the clipboard contents.
+    ///
+    /// See [`DataTransferSendBuilder`](crate::data_transfer::DataTransferSendBuilder) for how to
+    /// create a new cross-platform data transfer.
+    ///
+    /// The data is provided lazily: it is kept alive by the event loop and only encoded and sent
+    /// when another application requests one of the advertised types. It is released when
+    /// another application takes over the clipboard.
+    fn set_clipboard(&self, send_data: Box<dyn DataTransferSend>) -> Result<(), RequestError> {
+        let _ = send_data;
+        Err(RequestError::NotSupported(NotSupportedError::new(
+            DATA_TRANSFER_UNSUPPORTED_ERROR_MESSAGE,
+        )))
+    }
 }
 
 const DATA_TRANSFER_UNSUPPORTED_ERROR_MESSAGE: &str = {
