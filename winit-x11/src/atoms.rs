@@ -45,6 +45,7 @@ atom_manager! {
     TARGETS,
     TIMESTAMP,
     CLIPBOARD,
+    INCR,
 
     // Assorted ICCCM Atoms
     _NET_WM_ICON,

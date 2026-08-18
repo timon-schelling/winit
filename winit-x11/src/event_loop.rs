@@ -39,7 +39,7 @@ use x11rb::protocol::{xkb, xproto};
 use x11rb::x11_utils::X11Error as LogicalError;
 use x11rb::xcb_ffi::ReplyOrIdError;
 
-use crate::atoms::AtomName::{CLIPBOARD, UTF8_STRING};
+use crate::atoms::AtomName::{CLIPBOARD, TARGETS};
 use crate::atoms::{
     _NET_WM_PING, _NET_WM_SYNC_REQUEST, ABS_PRESSURE, ABS_TILT_X, ABS_TILT_Y, ABS_X, ABS_Y, Atoms,
     WM_DELETE_WINDOW,
@@ -391,6 +391,9 @@ impl EventLoop {
             active_window: None,
             modifiers: Default::default(),
             is_composing: false,
+
+            clip_incr_receive: Default::default(),
+            clip_incr_send: Default::default(),
         };
 
         // Register for device hotplug events
@@ -736,7 +739,7 @@ impl ActiveEventLoop {
     }
 
     /// We must choose a window to get the clipboard from or attach it to. Currently choose the
-    /// focused window (TODO: is this a good idea?).
+    /// focused window (TODO: better strategy?).
     fn get_clipboard_window(&self) -> Option<xproto::Window> {
         self.windows
             .borrow()
@@ -902,7 +905,9 @@ impl RootActiveEventLoop for ActiveEventLoop {
         // TODO: support other modes such as AtomEnum::PRIMARY.into(); AtomEnum::SECONDARY.into();
         let selection: xproto::Atom = atoms[CLIPBOARD];
         // TODO: support other targets
-        let target: xproto::Atom = atoms[UTF8_STRING];
+        let target: xproto::Atom = atoms[TARGETS];
+        // let target: xproto::Atom = atoms[crate::atoms::AtomName::ImageJpeg];
+        // let target: xproto::Atom = atoms[INCR];
 
         use x11rb::protocol::xproto::ConnectionExt;
 
@@ -910,29 +915,31 @@ impl RootActiveEventLoop for ActiveEventLoop {
             return Err(RequestError::Os(os_error!("Unable to find a clipboard window")));
         };
 
-        // TODO: keep ownership?
         let owner = con.get_selection_owner(selection).map_err(|err| {
             RequestError::Os(os_error!(format!(
                 "Could not assert ownership over selection {}: {err}",
-                self.x_connection().atom_to_string(selection)
+                self.x_connection().atom_str(selection)
             )))
         })?;
         if owner == window {
-            tracing::info!("We own the current selection!");
+            tracing::info!(
+                "We own the current selection! TODO: Just grab from local state than using the \
+                 X11 protocol. (use the protocol for testing)"
+            );
         }
 
         con.xcb_connection()
-            .convert_selection(window, selection, target, selection, CURRENT_TIME)
+            .convert_selection(window, selection, target, atoms[CLIPBOARD], CURRENT_TIME)
             .map_err(|err| {
                 RequestError::Os(os_error!(format!(
                     "Could not convert selection selection {}: {err}",
-                    self.x_connection().atom_to_string(selection)
+                    self.x_connection().atom_str(selection)
                 )))
             })?;
         tracing::info!(
             "Requested target {} from selection {} for {}",
-            con.atom_to_string(target),
-            con.atom_to_string(selection),
+            con.atom_str(target),
+            con.atom_str(selection),
             window
         );
         Ok(None)
@@ -950,7 +957,7 @@ impl RootActiveEventLoop for ActiveEventLoop {
             |err| {
                 RequestError::Os(os_error!(format!(
                     "Could not assert ownership on selection {}: {err}",
-                    self.x_connection().atom_to_string(selection)
+                    self.x_connection().atom_str(selection)
                 )))
             },
         )?;

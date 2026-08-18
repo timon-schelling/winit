@@ -302,7 +302,7 @@ impl XConnection {
         Ok(display_handle.into())
     }
 
-    /// Each selection must have a non-zero owner. An event can
+    /// Each selection must have a non-zero owner.
     pub fn get_selection_owner(&self, selection: xproto::Atom) -> Result<xproto::Window, X11Error> {
         let owner = self.xcb_connection().get_selection_owner(selection)?.reply()?;
         if owner.owner == 0 {
@@ -316,7 +316,7 @@ impl XConnection {
     /// - If possible, get the name from the X sever
     /// - Otherwise, pretty print as Atom(123)
     #[must_use]
-    pub fn atom_to_string(&self, atom: xproto::Atom) -> String {
+    pub fn atom_str(&self, atom: xproto::Atom) -> String {
         let atom_name = self.xcb_connection().get_atom_name(atom).ok();
         atom_name
             .and_then(|cookie| cookie.reply().ok())
