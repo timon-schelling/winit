@@ -42,6 +42,9 @@ atom_manager! {
     WM_PROTOCOLS,
     WM_STATE,
     XIM_SERVERS,
+    TARGETS,
+    TIMESTAMP,
+    CLIPBOARD,
 
     // Assorted ICCCM Atoms
     _NET_WM_ICON,

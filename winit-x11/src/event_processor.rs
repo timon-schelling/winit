@@ -24,12 +24,16 @@ use x11_dl::xinput2::{
 use x11_dl::xlib::{
     self, Display as XDisplay, Window as XWindow, XAnyEvent, XClientMessageEvent, XConfigureEvent,
     XDestroyWindowEvent, XEvent, XExposeEvent, XKeyEvent, XMapEvent, XPropertyEvent,
-    XReparentEvent, XSelectionEvent, XVisibilityEvent, XkbAnyEvent, XkbStateRec,
+    XReparentEvent, XSelectionEvent, XSelectionRequestEvent, XVisibilityEvent, XkbAnyEvent,
+    XkbStateRec,
 };
+use x11rb::CURRENT_TIME;
 use x11rb::protocol::sync::{ConnectionExt, Int64};
 use x11rb::protocol::xinput;
 use x11rb::protocol::xkb::ID as XkbId;
-use x11rb::protocol::xproto::{self, ConnectionExt as _, ModMask};
+use x11rb::protocol::xproto::{
+    self,  AtomEnum, ConnectionExt as _, ModMask, SELECTION_NOTIFY_EVENT, SelectionNotifyEvent,
+};
 use x11rb::x11_utils::{ExtensionInformation, Serialize};
 use xkbcommon_dl::xkb_mod_mask_t;
 
@@ -183,7 +187,9 @@ impl EventProcessor {
 
         match event_type {
             xlib::ClientMessage => self.client_message(xev.as_ref(), app),
+            xlib::SelectionRequest => self.selection_request(xev.as_ref(), app),
             xlib::SelectionNotify => self.selection_notify(xev.as_ref(), app),
+            xlib::SelectionClear => self.selection_clear(xev.as_ref(), app),
             xlib::ConfigureNotify => self.configure_notify(xev.as_ref(), app),
             xlib::ReparentNotify => self.reparent_notify(xev.as_ref()),
             xlib::MapNotify => self.map_notify(xev.as_ref(), app),
@@ -592,20 +598,109 @@ impl EventProcessor {
         }
     }
 
-    fn selection_notify(&mut self, xev: &XSelectionEvent, app: &mut dyn ApplicationHandler) {
-        let atoms = self.target.xconn.atoms();
+    /// Requests to access the clipboard could take many shapes which are handled here.
+    ///
+    /// TODO: use some internal state to get the dynamic value.
+    fn clipboard_resolve_property(&self, xev: &XSelectionRequestEvent) -> Option<xproto::Atom> {
+        let con = self.target.x_connection();
+        let atoms = con.atoms();
+        // For strange reasons, all the values in the input request are u64 whereas the sending uses
+        // a different library with u32s
+        let prop = xev.property as u32;
+        let target = xev.target as u32;
+        let requestor = xev.requestor as u32;
+        let mode = xproto::PropMode::REPLACE;
+        // Choose the handler for the type of selection
+        let result = if target == atoms[TARGETS] as _ {
+            let accepted =
+                &[atoms[TIMESTAMP] as u32, atoms[TARGETS] as u32, atoms[UTF8_STRING] as u32];
+            con.change_property(requestor, prop, xproto::AtomEnum::ATOM.into(), mode, accepted)
+        } else if target == atoms[TIMESTAMP] as _ {
+            con.change_property(requestor, prop, xproto::AtomEnum::INTEGER.into(), mode, &[
+                CURRENT_TIME,
+            ])
+        } else if target == atoms[UTF8_STRING] as _ {
+            let value = "the quick brown fox".as_bytes();
+            con.change_property(requestor, prop, target, mode, value)
+        } else {
+            warn!("Selection request for unknown selection target {}", con.atom_to_string(target));
+            return Option::None;
+        };
+        if let Err(err) = result {
+            tracing::error!(
+                "error writing to property {} value/target {} requestor {}: {err}",
+                con.atom_to_string(prop),
+                con.atom_to_string(target),
+                xev.requestor
+            );
+            return None;
+        }
+        tracing::info!(
+            "writing to property {} value/target {} requestor {}",
+            con.atom_to_string(prop),
+            con.atom_to_string(target),
+            xev.requestor
+        );
+        Some(xev.property as _)
+    }
 
-        let xwindow = xev.requestor as xproto::Window;
+    /// Handles the X11 `SelectionRequest` which occurs when we own a selection and another
+    /// application wants to read it
+    fn selection_request(&self, xev: &XSelectionRequestEvent, app: &mut dyn ApplicationHandler) {
+        let _ = app;
+
+        let con = self.target.x_connection();
+        tracing::info!(
+            "Selection request target {} property: {}",
+            con.atom_to_string(xev.target as _),
+            con.atom_to_string(xev.property as _)
+        );
+        // Location to store shouldn't be none
+        let notify = SelectionNotifyEvent {
+            response_type: SELECTION_NOTIFY_EVENT,
+            sequence: 0, // TODO: 0 seems to be fine but probably should be set?
+            time: CURRENT_TIME,
+            requestor: xev.requestor as _,
+            selection: xev.selection as _,
+            target: xev.target as _,
+            property: self.clipboard_resolve_property(xev).unwrap_or(AtomEnum::NONE.into()),
+        };
+        let result = con.xcb_connection()
+            .send_event(false, xev.requestor as u32, xproto::EventMask::PROPERTY_CHANGE, notify)
+            ;
+        if let Err(err) = result {
+            tracing::warn!("Got error when sending property change event for {}: {}", con.atom_to_string(xev.selection as _), err)
+        }
+    }
+
+    /// Handles the X11 SelectionNotify which occurs after `convert_selection` is called.
+    fn selection_notify(&mut self, xev: &XSelectionEvent, app: &mut dyn ApplicationHandler) {
+        let atoms = self.target.x_connection().atoms();
 
         // Set the timestamp.
-        self.target.xconn.set_timestamp(xev.time as xproto::Timestamp);
+        self.target.x_connection().set_timestamp(xev.time as xproto::Timestamp);
 
-        // For now, winit only supports selections for drag-and-drop. This should be changed
-        // when clipboard support is implemented.
-        if xev.property != atoms[XdndSelection] as c_ulong {
-            return;
+        // Choose the handler for the type of selection
+        if xev.property == atoms[XdndSelection] as c_ulong {
+            self.selection_notify_dnd(app, xev);
+        } else if xev.property == atoms[CLIPBOARD] as c_ulong {
+            self.selection_notify_clip(app, xev);
+        } else {
+            warn!(
+                "Selection notify for unknown selection property {}",
+                self.target.x_connection().atom_to_string(xev.property as _)
+            );
         }
+    }
 
+    /// Handles the X11 `SelectionClear` which occurs when we used to own a selection but now do not
+    fn selection_clear(&mut self, xev: &XSelectionEvent, app: &mut dyn ApplicationHandler) {
+        let _ = (xev, app);
+        tracing::warn!("Selection clear event unhandled (TODO: Clean up internal state storing our copy of the clipboard.)");
+    }
+
+    fn selection_notify_dnd(&mut self, app: &mut dyn ApplicationHandler, xev: &XSelectionEvent) {
+        let xwindow = xev.requestor as xproto::Window;
         let (transfer_id, serial, type_) = {
             let Some(state) = self.target.dnd.get_mut().state_mut() else {
                 return;
@@ -688,6 +783,33 @@ impl EventProcessor {
                 dnd.send_finished(this_window, target_window)
                     .expect("Failed to send `XdndFinished` message.");
             }
+        }
+    }
+
+    /// Got data for the clipboard
+    fn selection_notify_clip(&mut self, app: &mut dyn ApplicationHandler, xev: &XSelectionEvent) {
+        let _ = app;
+
+        let xwindow = xev.requestor as xproto::Window;
+        tracing::info!("Selection notify event for clipboard win {xwindow}");
+
+        let con = self.target.x_connection();
+        // TODO: make work using con.get_property
+        if xev.target == con.atoms()[TARGETS].into() {
+            let targets =
+                con.get_property::<u32>(xwindow, xev.property as _, AtomEnum::ATOM.into()).unwrap();
+            for target in targets {
+                tracing::info!("Name: {}", con.atom_to_string(target))
+            }
+        } else if xev.target == con.atoms()[UTF8_STRING].into() {
+            let value =
+                con.get_property::<u8>(xwindow, xev.property as _, xev.target as _).unwrap();
+            tracing::info!("Pasted string {:?}", String::from_utf8(value))
+        } else {
+            tracing::warn!(
+                "Selection notify for unknown target {}",
+                con.atom_to_string(xev.target as _)
+            )
         }
     }
 

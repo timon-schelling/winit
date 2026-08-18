@@ -301,6 +301,28 @@ impl XConnection {
 
         Ok(display_handle.into())
     }
+
+    /// Each selection must have a non-zero owner. An event can
+    pub fn get_selection_owner(&self, selection: xproto::Atom) -> Result<xproto::Window, X11Error> {
+        let owner = self.xcb_connection().get_selection_owner(selection)?.reply()?;
+        if owner.owner == 0 {
+            Err(X11Error::UnexpectedNull("getting owner of selection"))
+        } else {
+            Ok(owner.owner)
+        }
+    }
+
+    /// Gets a user readable string of the atom:
+    /// - If possible, get the name from the X sever
+    /// - Otherwise, pretty print as Atom(123)
+    #[must_use]
+    pub fn atom_to_string(&self, atom: xproto::Atom) -> String {
+        let atom_name = self.xcb_connection().get_atom_name(atom).ok();
+        atom_name
+            .and_then(|cookie| cookie.reply().ok())
+            .and_then(|reply| String::from_utf8(reply.name).ok())
+            .unwrap_or_else(|| format!("Atom({atom})"))
+    }
 }
 
 impl fmt::Debug for XConnection {

@@ -19,7 +19,7 @@ use tracing::warn;
 use winit_common::xkb::Context;
 use winit_core::application::ApplicationHandler;
 use winit_core::cursor::{CustomCursor as CoreCustomCursor, CustomCursorSource};
-use winit_core::data_transfer::{DataTransfer, DataTransferId, TransferType};
+use winit_core::data_transfer::{DataTransfer, DataTransferId, DataTransferSend, TransferType};
 use winit_core::error::{EventLoopError, NotSupportedError, RequestError};
 use winit_core::event::{DeviceId, StartCause, WindowEvent};
 use winit_core::event_loop::pump_events::PumpStatus;
@@ -30,13 +30,16 @@ use winit_core::event_loop::{
 };
 use winit_core::monitor::MonitorHandle as CoreMonitorHandle;
 use winit_core::window::{Theme, Window as CoreWindow, WindowAttributes, WindowId};
+use x11rb::CURRENT_TIME;
 use x11rb::connection::RequestConnection;
 use x11rb::errors::{ConnectError, ConnectionError, IdsExhausted, ReplyError};
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
+use x11rb::protocol::xproto::ConnectionExt;
 use x11rb::protocol::{xkb, xproto};
 use x11rb::x11_utils::X11Error as LogicalError;
 use x11rb::xcb_ffi::ReplyOrIdError;
 
+use crate::atoms::AtomName::{CLIPBOARD, UTF8_STRING};
 use crate::atoms::{
     _NET_WM_PING, _NET_WM_SYNC_REQUEST, ABS_PRESSURE, ABS_TILT_X, ABS_TILT_Y, ABS_X, ABS_Y, Atoms,
     WM_DELETE_WINDOW,
@@ -731,6 +734,16 @@ impl ActiveEventLoop {
     pub(crate) fn exit_code(&self) -> Option<i32> {
         self.exit.get()
     }
+
+    /// We must choose a window to get the clipboard from or attach it to. Currently choose the
+    /// focused window (TODO: is this a good idea?).
+    fn get_clipboard_window(&self) -> Option<xproto::Window> {
+        self.windows
+            .borrow()
+            .iter()
+            .find(|(_, window)| window.upgrade().is_some_and(|window| window.has_focus()))
+            .map(|(id, _)| id.into_raw() as _)
+    }
 }
 
 impl RootActiveEventLoop for ActiveEventLoop {
@@ -879,6 +892,68 @@ impl RootActiveEventLoop for ActiveEventLoop {
 
         state.accepted = !actions.is_empty();
 
+        Ok(())
+    }
+
+    fn clipboard(&self) -> Result<Option<DataTransferId>, RequestError> {
+        let con = self.x_connection();
+        let atoms = con.atoms();
+
+        // TODO: support other modes such as AtomEnum::PRIMARY.into(); AtomEnum::SECONDARY.into();
+        let selection: xproto::Atom = atoms[CLIPBOARD];
+        // TODO: support other targets
+        let target: xproto::Atom = atoms[UTF8_STRING];
+
+        use x11rb::protocol::xproto::ConnectionExt;
+
+        let Some(window) = self.get_clipboard_window() else {
+            return Err(RequestError::Os(os_error!("Unable to find a clipboard window")));
+        };
+
+        // TODO: keep ownership?
+        let owner = con.get_selection_owner(selection).map_err(|err| {
+            RequestError::Os(os_error!(format!(
+                "Could not assert ownership over selection {}: {err}",
+                self.x_connection().atom_to_string(selection)
+            )))
+        })?;
+        if owner == window {
+            tracing::info!("We own the current selection!");
+        }
+
+        con.xcb_connection()
+            .convert_selection(window, selection, target, selection, CURRENT_TIME)
+            .map_err(|err| {
+                RequestError::Os(os_error!(format!(
+                    "Could not convert selection selection {}: {err}",
+                    self.x_connection().atom_to_string(selection)
+                )))
+            })?;
+        tracing::info!(
+            "Requested target {} from selection {} for {}",
+            con.atom_to_string(target),
+            con.atom_to_string(selection),
+            window
+        );
+        Ok(None)
+    }
+
+    fn set_clipboard(&self, send_data: Box<dyn DataTransferSend>) -> Result<(), RequestError> {
+        let _ = send_data;
+        let con = self.x_connection();
+        let atoms = con.atoms();
+        let Some(window) = self.get_clipboard_window() else {
+            return Err(RequestError::Os(os_error!("Unable to find a clipboard window")));
+        };
+        let selection: xproto::Atom = atoms[CLIPBOARD];
+        con.xcb_connection().set_selection_owner(window, selection, CURRENT_TIME).map_err(
+            |err| {
+                RequestError::Os(os_error!(format!(
+                    "Could not assert ownership on selection {}: {err}",
+                    self.x_connection().atom_to_string(selection)
+                )))
+            },
+        )?;
         Ok(())
     }
 }
