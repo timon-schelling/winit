@@ -2,6 +2,9 @@
 
 #![warn(clippy::exhaustive_enums)]
 
+#[macro_use]
+extern crate tracing;
+
 use dpi::Size;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};

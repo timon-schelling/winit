@@ -30,21 +30,19 @@ use winit_core::event_loop::{
 };
 use winit_core::monitor::MonitorHandle as CoreMonitorHandle;
 use winit_core::window::{Theme, Window as CoreWindow, WindowAttributes, WindowId};
-use x11rb::CURRENT_TIME;
 use x11rb::connection::RequestConnection;
 use x11rb::errors::{ConnectError, ConnectionError, IdsExhausted, ReplyError};
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
-use x11rb::protocol::xproto::ConnectionExt;
 use x11rb::protocol::{xkb, xproto};
 use x11rb::x11_utils::X11Error as LogicalError;
 use x11rb::xcb_ffi::ReplyOrIdError;
 
-use crate::atoms::AtomName::{CLIPBOARD, TARGETS};
+use crate::atoms::AtomName::XdndSelection;
 use crate::atoms::{
     _NET_WM_PING, _NET_WM_SYNC_REQUEST, ABS_PRESSURE, ABS_TILT_X, ABS_TILT_Y, ABS_X, ABS_Y, Atoms,
     WM_DELETE_WINDOW,
 };
-use crate::dnd::Dnd;
+use crate::dnd::{ClipboardSelectionType, DataTransferState};
 use crate::event_processor::{EventProcessor, MAX_MOD_REPLAY_LEN};
 use crate::ime::{self, Ime, ImeCreationError, ImeSender};
 use crate::util::{self, CustomCursor};
@@ -175,7 +173,7 @@ impl<T> PeekableReceiver<T> {
 #[derive(Debug)]
 pub struct ActiveEventLoop {
     pub(crate) xconn: Arc<XConnection>,
-    pub(crate) dnd: RefCell<Dnd>,
+    pub(crate) data_transfer_state: RefCell<DataTransferState>,
     pub(crate) wm_delete_window: xproto::Atom,
     pub(crate) net_wm_ping: xproto::Atom,
     pub(crate) net_wm_sync_request: xproto::Atom,
@@ -234,7 +232,7 @@ impl EventLoop {
         let net_wm_ping = atoms[_NET_WM_PING];
         let net_wm_sync_request = atoms[_NET_WM_SYNC_REQUEST];
 
-        let dnd = Dnd::new(Arc::clone(&xconn)).into();
+        let data_transfer_state = DataTransferState::new(Arc::clone(&xconn)).into();
 
         let (ime_sender, ime_receiver) = mpsc::channel();
         let (ime_event_sender, ime_event_receiver) = mpsc::channel();
@@ -284,6 +282,11 @@ impl EventLoop {
             .extension_information(xkb::X11_EXTENSION_NAME)
             .expect("Failed to query XKB extension")
             .expect("X server missing XKB extension");
+        let xfixesext = xconn
+            .xcb_connection()
+            .extension_information(x11rb::protocol::xfixes::X11_EXTENSION_NAME)
+            .expect("Failed to query xfixes extension")
+            .expect("X server missing xfixes extension");
 
         // Check for XInput2 support.
         xconn
@@ -349,7 +352,7 @@ impl EventLoop {
 
         let window_target = ActiveEventLoop {
             ime,
-            dnd,
+            data_transfer_state,
             root,
             control_flow: Cell::new(ControlFlow::default()),
             exit: Cell::new(None),
@@ -384,6 +387,7 @@ impl EventLoop {
             xfiltered_modifiers: VecDeque::with_capacity(MAX_MOD_REPLAY_LEN),
             xmodmap,
             xkbext,
+            xfixesext,
             xkb_context,
             num_touch: 0,
             held_key_press: None,
@@ -391,9 +395,6 @@ impl EventLoop {
             active_window: None,
             modifiers: Default::default(),
             is_composing: false,
-
-            clip_incr_receive: Default::default(),
-            clip_incr_send: Default::default(),
         };
 
         // Register for device hotplug events
@@ -632,6 +633,7 @@ impl EventLoop {
         let mut xev = MaybeUninit::uninit();
 
         while let Some(xev) = self.event_processor.poll_one_event(&mut xev) {
+            info!("PROCESS XEV {xev:#?}");
             self.event_processor.process_event(xev, app);
         }
     }
@@ -815,17 +817,19 @@ impl RootActiveEventLoop for ActiveEventLoop {
     }
 
     fn data_transfer(&self, id: DataTransferId) -> Result<Box<dyn DataTransfer>, RequestError> {
-        let dnd = self.dnd.borrow();
+        let data_transfer = self.data_transfer_state.borrow();
 
-        if dnd.state().is_none_or(|state| state.transfer_id != id) {
-            return Err(RequestError::Ignored);
+        if let Some(state) = data_transfer.state()
+            && state.transfer_id == id
+        {
+            return Ok(Box::new(Selection::new(state.types.clone())));
         }
 
-        let Some(state) = dnd.state() else {
-            return Err(RequestError::Ignored);
-        };
+        if let Some(clipboard) = data_transfer.resolve_clipboard_type(id) {
+            return Ok(Box::new(data_transfer.get_clipboard(clipboard).get_types()));
+        }
 
-        Ok(Box::new(Selection::new(state.types.clone())))
+        Err(RequestError::Ignored)
     }
 
     fn fetch_data_transfer(
@@ -833,26 +837,24 @@ impl RootActiveEventLoop for ActiveEventLoop {
         id: DataTransferId,
         type_: &dyn TransferType,
     ) -> Result<AsyncRequestSerial, RequestError> {
-        let mut dnd = self.dnd.borrow_mut();
+        let mut data_transfer = self.data_transfer_state.borrow_mut();
 
         let serial = AsyncRequestSerial::get();
 
-        let type_ = type_
-            .cast_ref::<SelectionType>()
-            .or_else(|| dnd.find_type_by_hint(type_.hint()?))
-            .cloned()
-            .ok_or(RequestError::NotSupported(NotSupportedError::new("Unknown type hint")))?;
+        let new_convert_selection = if let Some(state) = data_transfer.state()
+            && state.transfer_id == id
+        {
+            let type_ = type_
+                .cast_ref::<SelectionType>()
+                .or_else(|| data_transfer.find_type_by_hint(type_.hint()?))
+                .cloned()
+                .ok_or(RequestError::NotSupported(NotSupportedError::new("Unknown type hint")))?;
 
-        let new_convert_selection = {
-            let Some(state) = dnd.state_mut() else {
+            let Some(state) = data_transfer.state_mut() else {
                 return Err(RequestError::Ignored);
             };
 
-            if state.transfer_id != id {
-                return Err(RequestError::NotSupported(NotSupportedError::new(
-                    "Unknown data transfer",
-                )));
-            }
+            if state.transfer_id != id {}
 
             // If it's non-empty, assume that we're still waiting on some other fetch operation.
             // The `SelectionNotify` handler will send a new `convert_selection` event if any
@@ -863,17 +865,38 @@ impl RootActiveEventLoop for ActiveEventLoop {
 
             state.pending_fetch_types.push_back((serial, type_));
 
+            let selection = self.xconn.atoms()[XdndSelection];
+            should_emit_convert_selection.then_some((state.target_window, selection, atom))
+        } else if let Some(clipboard) = data_transfer.resolve_clipboard_type(id) {
+            let ty = type_
+                .cast_ref::<SelectionType>()
+                .or_else(|| data_transfer.get_clipboard(clipboard).find_type_by_hint(type_.hint()?))
+                .cloned()
+                .ok_or(RequestError::NotSupported(NotSupportedError::new("Unknown type hint")))?;
+            let Some(clip_win) = self.get_clipboard_window() else {
+                return Err(RequestError::NotSupported(NotSupportedError::new("Unknown window")));
+            };
+            let reading_atom = ty.atom();
+            let reading_name = self.x_connection().atom_str(reading_atom);
+            info!("We have chosen to try and read property {reading_name}");
+
+            let should_emit_convert_selection =
+                data_transfer.get_clipboard_mut(clipboard).add_to_fetch(serial, ty);
+
             should_emit_convert_selection.then_some((
-                state.target_window,
-                self.xconn.timestamp(),
-                atom,
+                clip_win,
+                clipboard.to_atom(self.xconn.atoms()),
+                reading_atom,
             ))
+        } else {
+            None
         };
 
-        if let Some((window, time, new_type)) = new_convert_selection {
-            // This results in the `SelectionNotify` event
-            dnd.convert_selection(window, time, new_type);
-        }
+        if let Some((window, selection, target)) = new_convert_selection {
+            data_transfer.convert_selection(window, selection, target, selection);
+        };
+        // TODO: The result is stored into a property with the same name as the selection. Consider
+        // using a different name to avoid conflict.
 
         Ok(serial)
     }
@@ -883,9 +906,9 @@ impl RootActiveEventLoop for ActiveEventLoop {
         id: DataTransferId,
         actions: &[DndAction],
     ) -> Result<(), RequestError> {
-        let mut dnd = self.dnd.borrow_mut();
+        let mut data_transfer = self.data_transfer_state.borrow_mut();
 
-        let Some(state) = dnd.state_mut() else {
+        let Some(state) = data_transfer.state_mut() else {
             return Err(os_error!(UnknownDataTransfer(id)).into());
         };
 
@@ -899,68 +922,22 @@ impl RootActiveEventLoop for ActiveEventLoop {
     }
 
     fn clipboard(&self) -> Result<Option<DataTransferId>, RequestError> {
-        let con = self.x_connection();
-        let atoms = con.atoms();
-
-        // TODO: support other modes such as AtomEnum::PRIMARY.into(); AtomEnum::SECONDARY.into();
-        let selection: xproto::Atom = atoms[CLIPBOARD];
-        // TODO: support other targets
-        let target: xproto::Atom = atoms[TARGETS];
-        // let target: xproto::Atom = atoms[crate::atoms::AtomName::ImageJpeg];
-        // let target: xproto::Atom = atoms[INCR];
-
-        use x11rb::protocol::xproto::ConnectionExt;
-
-        let Some(window) = self.get_clipboard_window() else {
-            return Err(RequestError::Os(os_error!("Unable to find a clipboard window")));
+        let Some(xwindow) = self.get_clipboard_window() else {
+            return Err(os_error!("no active window").into());
         };
-
-        let owner = con.get_selection_owner(selection).map_err(|err| {
-            RequestError::Os(os_error!(format!(
-                "Could not assert ownership over selection {}: {err}",
-                self.x_connection().atom_str(selection)
-            )))
-        })?;
-        if owner == window {
-            tracing::info!(
-                "We own the current selection! TODO: Just grab from local state than using the \
-                 X11 protocol. (use the protocol for testing)"
-            );
-        }
-
-        con.xcb_connection()
-            .convert_selection(window, selection, target, atoms[CLIPBOARD], CURRENT_TIME)
-            .map_err(|err| {
-                RequestError::Os(os_error!(format!(
-                    "Could not convert selection selection {}: {err}",
-                    self.x_connection().atom_str(selection)
-                )))
-            })?;
-        tracing::info!(
-            "Requested target {} from selection {} for {}",
-            con.atom_str(target),
-            con.atom_str(selection),
-            window
-        );
-        Ok(None)
+        let mut data_transfer = self.data_transfer_state.borrow_mut();
+        let serial =
+            data_transfer.request_clipboard_read(xwindow, ClipboardSelectionType::Clipboard);
+        Ok(Some(serial))
     }
 
     fn set_clipboard(&self, send_data: Box<dyn DataTransferSend>) -> Result<(), RequestError> {
-        let _ = send_data;
-        let con = self.x_connection();
-        let atoms = con.atoms();
-        let Some(window) = self.get_clipboard_window() else {
-            return Err(RequestError::Os(os_error!("Unable to find a clipboard window")));
+        let Some(xwindow) = self.get_clipboard_window() else {
+            return Err(os_error!("no active window").into());
         };
-        let selection: xproto::Atom = atoms[CLIPBOARD];
-        con.xcb_connection().set_selection_owner(window, selection, CURRENT_TIME).map_err(
-            |err| {
-                RequestError::Os(os_error!(format!(
-                    "Could not assert ownership on selection {}: {err}",
-                    self.x_connection().atom_str(selection)
-                )))
-            },
-        )?;
+        let mut data_transfer = self.data_transfer_state.borrow_mut();
+        data_transfer.set_clipboard(xwindow, send_data, ClipboardSelectionType::Clipboard);
+
         Ok(())
     }
 }

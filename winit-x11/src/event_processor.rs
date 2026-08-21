@@ -6,7 +6,6 @@ use std::slice;
 use std::sync::{Arc, Mutex};
 
 use dpi::{PhysicalPosition, PhysicalSize};
-use tracing::warn;
 use winit_common::xkb::{self, Context, XkbState};
 use winit_core::application::ApplicationHandler;
 use winit_core::event::{
@@ -36,7 +35,7 @@ use x11rb::x11_utils::{ExtensionInformation, Serialize};
 use xkbcommon_dl::xkb_mod_mask_t;
 
 use crate::atoms::*;
-use crate::dnd::{DndState, SelectionType};
+use crate::dnd::{ClipboardSelectionType, DndState, SelectionType};
 use crate::event_loop::{
     ALL_DEVICES, ActiveEventLoop, CookieResultExt, Device, DeviceInfo, DeviceType,
     ScrollOrientation, mkdid, mkwid,
@@ -52,30 +51,6 @@ pub const MAX_MOD_REPLAY_LEN: usize = 32;
 /// The X11 documentation states: "Keycodes lie in the inclusive range `[8, 255]`".
 const KEYCODE_OFFSET: u8 = 8;
 
-/// State for the INCR clipboard protocol. The protocol works as follows:
-/// - Paster calls convert_selection
-/// - Copier receives a SelectionNotify event and returns empty data and a type of INCR
-/// - Paster deletes the property where the empty data was sent
-/// - Copier listens for the delete property message and then puts the first chunk of actual data
-/// - Paster listens for the new property message and grabs the data, then deletes the property.
-/// - Copier puts then next chunk of data
-/// - etc.
-/// - When the copier puts an empty chunk of data, the sequence is over.
-#[derive(Debug, Default)]
-pub enum ClipIncrState {
-    #[default]
-    None,
-    Incr {
-        /// The partial bytes of data
-        data: Vec<u8>,
-        /// The place where the INCR protocol takes place (is modified with each chunk) e.g.
-        /// CLIPBOARD
-        property: xproto::Atom,
-        /// The data type transmitted e.g. UTF8_STRING
-        ty: xproto::Atom,
-    },
-}
-
 #[derive(Debug)]
 pub struct EventProcessor {
     pub ime_receiver: ImeReceiver,
@@ -84,6 +59,7 @@ pub struct EventProcessor {
     pub devices: RefCell<HashMap<DeviceId, Device>>,
     pub xi2ext: ExtensionInformation,
     pub xkbext: ExtensionInformation,
+    pub xfixesext: ExtensionInformation,
     pub target: ActiveEventLoop,
     pub xkb_context: Context,
     // Number of touch events currently in progress
@@ -104,15 +80,7 @@ pub struct EventProcessor {
     pub xfiltered_modifiers: VecDeque<u8>,
     pub xmodmap: util::ModifierKeymap,
     pub is_composing: bool,
-
-    /// Contains the partially received message from the clipboard
-    pub clip_incr_receive: ClipIncrState,
-    /// Contains the remenants of the message that are yet to be sent to the current clipboard
-    /// recipiant
-    pub clip_incr_send: ClipIncrState,
 }
-
-const INCR_CHUNK_SIZE_BYTES: usize = 16;
 
 impl EventProcessor {
     pub(crate) fn process_event(&mut self, xev: &mut XEvent, app: &mut dyn ApplicationHandler) {
@@ -217,9 +185,9 @@ impl EventProcessor {
 
         match event_type {
             xlib::ClientMessage => self.client_message(xev.as_ref(), app),
-            xlib::SelectionRequest => self.selection_request(xev.as_ref(), app),
+            xlib::SelectionRequest => self.selection_request(xev.as_ref()),
             xlib::SelectionNotify => self.selection_notify(xev.as_ref(), app),
-            xlib::SelectionClear => self.selection_clear(xev.as_ref(), app),
+            xlib::SelectionClear => self.selection_clear(xev.as_ref()),
             xlib::ConfigureNotify => self.configure_notify(xev.as_ref(), app),
             xlib::ReparentNotify => self.reparent_notify(xev.as_ref()),
             xlib::MapNotify => self.map_notify(xev.as_ref(), app),
@@ -323,6 +291,10 @@ impl EventProcessor {
                 }
                 if event_type == self.randr_event_offset as c_int {
                     self.process_dpi_change(app);
+                }
+                if event_type == self.xfixesext.first_event as _ {
+                    // let xev: &XkbAnyEvent = unsafe { &*(xev as *const _ as *const XkbAnyEvent) };
+                    info!("XFIXES EVENT");
                 }
             },
         }
@@ -468,7 +440,7 @@ impl EventProcessor {
             // Cautiously limit the scope of the `dnd` lock so we don't rely on `app.window_event`
             // never contending the lock.
             let transfer_id = {
-                let mut dnd = self.target.dnd.borrow_mut();
+                let mut dnd = self.target.data_transfer_state.borrow_mut();
                 let source_window = xev.data.get_long(0) as xproto::Window;
                 let flags = xev.data.get_long(1);
 
@@ -530,7 +502,7 @@ impl EventProcessor {
             // Cautiously limit the scope of the `dnd` lock so we don't rely on `app.window_event`
             // never contending the lock.
             let transfer_id = {
-                let dnd = self.target.dnd.borrow();
+                let dnd = self.target.data_transfer_state.borrow();
                 let Some(state) = dnd.state() else {
                     return;
                 };
@@ -575,7 +547,7 @@ impl EventProcessor {
 
         if xev.message_type == atoms[XdndDrop] as c_ulong {
             let (source_window, transfer_id) = {
-                let dnd = self.target.dnd.borrow();
+                let dnd = self.target.data_transfer_state.borrow();
                 let Some(state) = dnd.state() else {
                     warn!("Received `XdndDrop` without `XdndEnter`");
                     return;
@@ -601,7 +573,7 @@ impl EventProcessor {
                 },
             );
 
-            let mut dnd = self.target.dnd.borrow_mut();
+            let mut dnd = self.target.data_transfer_state.borrow_mut();
 
             if let Some(state) =
                 dnd.state_mut().filter(|state| !state.pending_fetch_types.is_empty())
@@ -618,7 +590,7 @@ impl EventProcessor {
         }
 
         if xev.message_type == atoms[XdndLeave] as c_ulong {
-            let dnd = self.target.dnd.borrow();
+            let dnd = self.target.data_transfer_state.borrow();
             let Some(state) = dnd.state() else {
                 return;
             };
@@ -628,110 +600,24 @@ impl EventProcessor {
         }
     }
 
-    /// Requests to access the clipboard could take many shapes which are handled here.
-    ///
-    /// TODO: use some internal state to get the dynamic value.
-    fn clipboard_resolve_property(&mut self, xev: &XSelectionRequestEvent) -> Option<xproto::Atom> {
-        let con = self.target.x_connection();
-        let atoms = con.atoms();
-        // For strange reasons, all the values in the input request are u64 whereas the sending uses
-        // a different library with u32s
-        let prop = xev.property as xproto::Atom;
-        let target = xev.target as xproto::Atom;
-        let requestor = xev.requestor as xproto::Window;
-        let mode = xproto::PropMode::REPLACE;
-        // Choose the handler for the type of selection
-        let result = if target == atoms[TARGETS] as _ {
-            // TODO: dynamically select accepted types
-            let accepted: &[xproto::Atom; _] =
-                &[atoms[TIMESTAMP] as _, atoms[TARGETS] as _, atoms[UTF8_STRING] as _];
-            con.change_property(requestor, prop, xproto::AtomEnum::ATOM.into(), mode, accepted)
-                .map(|_| ())
-        } else if target == atoms[TIMESTAMP] as _ {
-            con.change_property(requestor, prop, xproto::AtomEnum::INTEGER.into(), mode, &[
-                CURRENT_TIME,
-            ])
-            .map(|_| ())
-        } else if target == atoms[UTF8_STRING] as _ {
-            let value = "the quick brown fox ".to_string().into_bytes();
-            // TODO: direct send if small with the following line of code (rather than using incr)
-            // con.change_property(requestor, prop, target, mode, value).map(|_|())
-
-            self.start_incr_sender(xev, value)
-        } else {
-            warn!("Selection request for unknown selection target {}", con.atom_str(target));
-            return Option::None;
-        };
-        let con = self.target.x_connection();
-        if let Err(err) = result {
-            tracing::error!(
-                "error writing {} into {}: {err}",
-                con.atom_str(target),
-                con.atom_str(prop),
-            );
-            return Option::None;
-        }
-        tracing::info!("Written {} into property {} ", con.atom_str(target), con.atom_str(prop),);
-        Some(xev.property as _)
-    }
-
-    /// Sets up the sending for the INCR
-    fn start_incr_sender(
-        &mut self,
-        xev: &XSelectionRequestEvent,
-        value: Vec<u8>,
-    ) -> Result<(), crate::event_loop::X11Error> {
-        tracing::info!("Starting INCR");
-        let con = self.target.x_connection();
-        let atoms = con.atoms();
-        // For strange reasons, all the values in the input request are u64 whereas the sending uses
-        // a different library with u32s
-        let prop = xev.property as u32;
-        let target = xev.target as u32;
-        let requestor = xev.requestor as u32;
-        let mode = xproto::PropMode::REPLACE;
-
-        let current_attributes = con.xcb_connection().get_window_attributes(requestor)?.reply()?;
-        // Add the property change listner to the existing mask so we do not delete bits
-        let event_mask =
-            Some(current_attributes.your_event_mask | xproto::EventMask::PROPERTY_CHANGE);
-
-        // For INCR we must know when the recipiant deletes the property to add some more
-        // Therefore we listen for property change events on the other window
-        con.xcb_connection().change_window_attributes(
-            requestor,
-            &xproto::ChangeWindowAttributesAux { event_mask, ..Default::default() },
-        )?;
-        self.clip_incr_send = ClipIncrState::Incr { data: value, property: prop, ty: target };
-        con.change_property::<u32>(requestor, prop, atoms[INCR], mode, &[]).map(|_| ())
-    }
-
     /// Handles the X11 `SelectionRequest` which occurs when we own a selection and another
     /// application wants to read it
-    fn selection_request(
-        &mut self,
-        xev: &XSelectionRequestEvent,
-        app: &mut dyn ApplicationHandler,
-    ) {
-        let _ = app;
-        let con = self.target.x_connection();
-
-        tracing::info!(
-            "Selection request for {} into property {}",
-            con.atom_str(xev.target as _),
-            con.atom_str(xev.property as _)
-        );
-        let property =
-            self.clipboard_resolve_property(xev).unwrap_or(xproto::AtomEnum::NONE.into());
-        // Location to store shouldn't be none
+    fn selection_request(&mut self, xev: &XSelectionRequestEvent) {
+        let mut data_transfer = self.target.data_transfer_state.borrow_mut();
+        // Put the property on the clipboard
+        if !data_transfer.attach_clipboard_property(xev) {
+            info!("Not sending selection notify, no resolved value");
+            return;
+        }
+        // Notify the other program that we've put the poperty on the clipboard
         let notify = xproto::SelectionNotifyEvent {
             response_type: xproto::SELECTION_NOTIFY_EVENT,
-            sequence: 0, // TODO: 0 seems to be fine but probably should be set?
+            sequence: 0,
             time: CURRENT_TIME,
             requestor: xev.requestor as _,
             selection: xev.selection as _,
             target: xev.target as _,
-            property,
+            property: xev.property as _,
         };
         let con = self.target.x_connection();
         let result = con.xcb_connection().send_event(
@@ -740,8 +626,9 @@ impl EventProcessor {
             xproto::EventMask::PROPERTY_CHANGE,
             notify,
         );
+        info!("Sending property change to dest {}", xev.requestor);
         if let Err(err) = result {
-            tracing::warn!(
+            warn!(
                 "Got error when sending property change event for {}: {}",
                 con.atom_str(xev.selection as _),
                 err
@@ -758,10 +645,10 @@ impl EventProcessor {
         self.target.x_connection().set_timestamp(xev.time as xproto::Timestamp);
 
         // Choose the handler for the type of selection
-        if xev.property == atoms[XdndSelection] as c_ulong {
+        if xev.selection == atoms[XdndSelection] as c_ulong {
             self.selection_notify_dnd(app, xev);
-        } else if xev.property == atoms[CLIPBOARD] as c_ulong {
-            self.selection_notify_clip(app, xev);
+        } else if ClipboardSelectionType::from_atom(atoms, xev.selection as _).is_some() {
+            self.selection_notify_clip(app,xev);
         } else {
             warn!(
                 "Selection notify for unknown selection property {}",
@@ -771,18 +658,21 @@ impl EventProcessor {
     }
 
     /// Handles the X11 `SelectionClear` which occurs when we used to own a selection but now do not
-    fn selection_clear(&mut self, xev: &XSelectionEvent, app: &mut dyn ApplicationHandler) {
-        let _ = (xev, app);
-        tracing::warn!(
-            "Selection clear event unhandled (TODO: Clean up internal state storing our copy of \
-             the clipboard.)"
-        );
+    fn selection_clear(&mut self, xev: &XSelectionEvent) {
+        let atoms = self.target.x_connection().atoms();
+        let Some(clipboard) = ClipboardSelectionType::from_atom(atoms, xev.selection as _) else {
+            return;
+        };
+        let mut data_transfer = self.target.data_transfer_state.borrow_mut();
+        if data_transfer.get_clipboard_mut(clipboard).clear_owned_data() {
+            info!("Cleared owned data for {clipboard:?}");
+        }
     }
 
     fn selection_notify_dnd(&mut self, app: &mut dyn ApplicationHandler, xev: &XSelectionEvent) {
         let xwindow = xev.requestor as xproto::Window;
         let (transfer_id, serial, type_) = {
-            let Some(state) = self.target.dnd.get_mut().state_mut() else {
+            let Some(state) = self.target.data_transfer_state.get_mut().state_mut() else {
                 return;
             };
 
@@ -829,7 +719,7 @@ impl EventProcessor {
             (state.transfer_id, serial, type_)
         };
 
-        let value = match self.target.dnd.borrow().read_data(xwindow, type_) {
+        let value = match self.target.data_transfer_state.borrow().read_data(xwindow, type_) {
             Ok(value) => Arc::new(value),
             Err(err) => {
                 warn!("Failed to read selection: {err}");
@@ -845,7 +735,7 @@ impl EventProcessor {
             value,
         });
 
-        let dnd = self.target.dnd.borrow();
+        let dnd = self.target.data_transfer_state.borrow();
 
         // If we have another fetch pending, request it from the drag source window
         if let Some((window, type_)) = dnd.state().and_then(|state| {
@@ -855,7 +745,10 @@ impl EventProcessor {
                 .cloned()
                 .map(|(_, type_)| (state.target_window, type_))
         }) {
-            dnd.convert_selection(window, self.target.xconn.timestamp(), type_.atom());
+            let selection = self.target.xconn.atoms()[XdndSelection];
+            // TODO: The result is stored into a property named XdndSelection. Consider using a
+            // different name to avoid conflict.
+            dnd.convert_selection(window, selection, type_.atom(), selection);
         } else if let Some((this_window, target_window)) =
             dnd.state().and_then(|state| state.finished)
         {
@@ -866,127 +759,47 @@ impl EventProcessor {
         }
     }
 
-    /// From the list of available targets, chose the correct one and request it.
-    fn select_targest_from_list(
-        &self,
-        xev: &XSelectionEvent,
-        xwindow: xproto::Window,
-        data: Vec<u8>,
-    ) {
-        let con = self.target.x_connection();
-        let atoms = con.atoms();
-        let targets = bytemuck::pod_collect_to_vec(&data);
-        let mut reading = Option::None;
-        for &target in targets.iter() {
-            if target == atoms[ImagePng] || target == atoms[ImageJpeg] {
-                reading = Some(target);
-            } else if target == atoms[UTF8_STRING] && reading.is_none() {
-                reading = Some(target);
-            }
-        }
-        let available = targets.iter().map(|&t| con.atom_str(t)).collect::<Vec<_>>().join(", ");
-        let Some(reading) = reading else {
-            tracing::error!("We do not wish to read any of the available targets [{available}]");
-            return;
-        };
-        tracing::info!(
-            "We have chosen to try and read property {} of [{}]",
-            con.atom_str(reading),
-            available
-        );
-        let result = con.xcb_connection().convert_selection(
-            xwindow,
-            xev.property as _,
-            reading as _,
-            xev.property as u32,
-            CURRENT_TIME,
-        );
-        if let Err(err) = result {
-            tracing::error!(
-                "Failed to convert_selection for property {}: {} ",
-                con.atom_str(reading),
-                err
-            )
-        }
-    }
-
-    /// Reads a property, appending to the `result` buffer and returning the actual type and read
-    /// bytes. Note that the `XConnection::get_property` doesn't work as it cannot return the type
-    /// and cannot fetch Any.
-    fn read_property(
-        &self,
-        property: xproto::Atom,
-        xwindow: xproto::Window,
-        result: &mut Vec<u8>,
-    ) -> Result<(xproto::Atom, usize), crate::event_loop::X11Error> {
-        let con = self.target.x_connection().xcb_connection();
-        let mut resolved_format_type = Option::None;
-        // Max data transferred in bytes (must be multiple of 4 for unknown reasons)
-        const MAX_TRANSFER_SIZE_BYTES: u32 = 1024;
-        let mut bytes_read = 0;
-        loop {
-            let cookie = con.get_property(
-                true,
-                xwindow,
-                property,
-                xproto::AtomEnum::ANY,
-                bytes_read as u32 / 4, // Offset in 4 bytes to start of property
-                MAX_TRANSFER_SIZE_BYTES / 4, // Number of 4 bytes to get
-            )?;
-            let reply = cookie.reply()?;
-            let format_type = (reply.format, reply.type_);
-            // Format type must not change
-            assert!(resolved_format_type.is_none_or(|resolved| resolved == format_type));
-            resolved_format_type = Some(format_type);
-            result.extend_from_slice(&reply.value);
-            bytes_read += reply.value.len();
-            if reply.bytes_after == 0 {
-                tracing::info!(
-                    "Read {} into property {} data {}",
-                    self.target.x_connection().atom_str(reply.type_),
-                    self.target.x_connection().atom_str(property),
-                    if result.len() < 100 {
-                        format!("{result:?}")
-                    } else {
-                        "[... many bytes]".to_string()
-                    }
-                );
-                return Ok((reply.type_, bytes_read));
-            }
-        }
-    }
-
     /// Data received from another application
     fn selection_notify_clip(&mut self, app: &mut dyn ApplicationHandler, xev: &XSelectionEvent) {
-        let _ = app;
-
         let xwindow = xev.requestor as xproto::Window;
         let property = xev.property as xproto::Atom;
-        tracing::info!("Data recieved from another process (SelectionNotify)");
+
+        if !self.window_exists(xwindow) {
+            return;
+        }
+
+        info!("Data recieved from another process (SelectionNotify)");
 
         let con = self.target.x_connection();
         let atoms = con.atoms();
 
+        let mut data_transfer = self.target.data_transfer_state.borrow_mut();
         let mut property_value = Vec::new();
-        let property_ty = match self.read_property(property, xwindow, &mut property_value) {
+        let property_ty = match con.get_dynamic_property(property, xwindow, &mut property_value) {
             Ok((property_ty, _)) => property_ty,
             Err(e) => {
-                tracing::error!("Unable to read property: {e}");
+                error!("Unable to read property on notify clip: {e}");
                 return;
             },
         };
-        // Exit now if using incr
+        // // Exit now if using incr
         if property_ty == con.atoms()[INCR].into() {
-            self.clip_incr_receive =
-                ClipIncrState::Incr { data: Vec::new(), property, ty: xev.target as _ };
+            data_transfer.start_incr_receiver(xev);
             return;
         }
 
-        if xev.target == atoms[TARGETS].into() || xev.target as u32 == xproto::AtomEnum::ATOM.into()
+        if xev.target == atoms[TARGETS].into()
+            || xev.target as xproto::Atom == xproto::AtomEnum::ATOM.into()
         {
-            self.select_targest_from_list(xev, xwindow, property_value);
-        } else {
-            self.paste_data_loaded(property_value, property_ty);
+            data_transfer.populate_targets(xev.selection as _, property_value);
+        } else if let Some(clipboard) =
+            ClipboardSelectionType::from_atom(con.atoms(), xev.selection as _)
+        {
+            if let Some(data) =
+                data_transfer.send_clipboard_data(xwindow, clipboard, property_value)
+            {
+                app.window_event(&self.target, data.window(), data.to_event());
+            }
         }
     }
 
@@ -1207,31 +1020,6 @@ impl EventProcessor {
         app.window_event(&self.target, window_id, WindowEvent::Destroyed);
     }
 
-    /// When the data is fully pasted
-    ///
-    /// TODO: forward to application
-    fn paste_data_loaded(&self, data: Vec<u8>, property_ty: u32) {
-        let con = self.target.x_connection();
-        let atoms = con.atoms();
-        if property_ty == atoms[ImagePng] {
-            use std::io::Write;
-            let name = "copied_clipboard.png";
-            let mut file = std::fs::File::create(name).unwrap();
-            file.write_all(&data).unwrap();
-            tracing::info!("Since this is a PNG, it is easy if it is in a file name: {}", name);
-        } else if property_ty == atoms[ImageJpeg] {
-            use std::io::Write;
-            let name = "copied_clipboard.jpeg";
-            let mut file = std::fs::File::create(name).unwrap();
-            file.write_all(&data).unwrap();
-            tracing::info!("Since this is a JPEG, it is easy if it is in a file name: {}", name);
-        } else if property_ty == atoms[UTF8_STRING] {
-            tracing::info!("The data is a string with value: {:?}", String::from_utf8(data));
-        } else {
-            tracing::info!("Data {}: {:?}", con.atom_str(property_ty), data);
-        }
-    }
-
     fn property_notify(&mut self, xev: &XPropertyEvent, app: &mut dyn ApplicationHandler) {
         let con = self.target.x_connection();
         let atoms = con.atoms();
@@ -1242,68 +1030,12 @@ impl EventProcessor {
         {
             self.process_dpi_change(app);
         }
-        let xwindow = xev.window as xproto::Window;
 
-        // If we are the ones receiving and there is some new value for the clipboard property
-        if let ClipIncrState::Incr { data, property, ty } = &mut self.clip_incr_receive
-            && atom == *property
-            && xev.state as u32 == xproto::Property::NEW_VALUE.into()
-        {
-            let ty = *ty;
-            let property = *property;
-            // Remove the previously loaded bytes from the state (for borrow checker)
-            let mut current_value = std::mem::take(data);
-            // Apeend the property to the cache
-            let (property_ty, read_bytes) =
-                match self.read_property(atom, xwindow, &mut current_value) {
-                    Ok(value) => value,
-                    Err(e) => {
-                        tracing::error!("Unable to read property: {e}");
-                        return;
-                    },
-                };
-            if read_bytes > 0 {
-                // Load the new bytes back in
-                self.clip_incr_receive = ClipIncrState::Incr { data: current_value, property, ty };
-            } else {
-                tracing::info!(
-                    "We are done receiving from {} ty {}",
-                    con.atom_str(property),
-                    con.atom_str(ty)
-                );
-                self.clip_incr_receive = ClipIncrState::None;
-                self.paste_data_loaded(current_value, property_ty);
-            }
+        let mut data_transfer = self.target.data_transfer_state.borrow_mut();
+        if let Some(data) = data_transfer.check_incr_receive_data(xev) {
+            app.window_event(&self.target, data.window(), data.to_event());
         }
-        // If we are the ones sending and the reciever deleted their property for the clipboard then
-        // update
-        if let ClipIncrState::Incr { data, property, ty } = &mut self.clip_incr_send
-            && atom == *property
-            && xev.state as u32 == xproto::Property::DELETE.into()
-        {
-            let bytes_to_take = INCR_CHUNK_SIZE_BYTES.min(data.len());
-            let sending = &data[..bytes_to_take];
-            if let Err(err) =
-                con.change_property(xwindow, atom, *ty, xproto::PropMode::REPLACE, sending)
-            {
-                tracing::error!(
-                    "Unable to change property {} for INCR: {}",
-                    con.atom_str(atom),
-                    err
-                );
-                return;
-            }
-            tracing::info!("Written partial data {:?} to {} ", sending, con.atom_str(atom),);
-            data.drain(..bytes_to_take);
-            if bytes_to_take == 0 {
-                tracing::info!(
-                    "We are done sending {} ty {}",
-                    con.atom_str(*property),
-                    con.atom_str(*ty)
-                );
-                self.clip_incr_send = ClipIncrState::None;
-            }
-        }
+        data_transfer.check_incr_send_data(xev);
     }
 
     fn visibility_notify(&self, xev: &XVisibilityEvent, app: &mut dyn ApplicationHandler) {

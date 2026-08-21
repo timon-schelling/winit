@@ -302,16 +302,6 @@ impl XConnection {
         Ok(display_handle.into())
     }
 
-    /// Each selection must have a non-zero owner.
-    pub fn get_selection_owner(&self, selection: xproto::Atom) -> Result<xproto::Window, X11Error> {
-        let owner = self.xcb_connection().get_selection_owner(selection)?.reply()?;
-        if owner.owner == 0 {
-            Err(X11Error::UnexpectedNull("getting owner of selection"))
-        } else {
-            Ok(owner.owner)
-        }
-    }
-
     /// Gets a user readable string of the atom:
     /// - If possible, get the name from the X sever
     /// - Otherwise, pretty print as Atom(123)
