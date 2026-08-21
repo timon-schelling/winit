@@ -232,8 +232,6 @@ impl EventLoop {
         let net_wm_ping = atoms[_NET_WM_PING];
         let net_wm_sync_request = atoms[_NET_WM_SYNC_REQUEST];
 
-        let data_transfer_state = DataTransferState::new(Arc::clone(&xconn)).into();
-
         let (ime_sender, ime_receiver) = mpsc::channel();
         let (ime_event_sender, ime_event_receiver) = mpsc::channel();
         // Input methods will open successfully without setting the locale, but it won't be
@@ -288,6 +286,7 @@ impl EventLoop {
             .expect("Failed to query xfixes extension")
             .expect("X server missing xfixes extension");
 
+        let data_transfer_state = DataTransferState::new(Arc::clone(&xconn)).into();
         // Check for XInput2 support.
         xconn
             .xcb_connection()
@@ -633,7 +632,6 @@ impl EventLoop {
         let mut xev = MaybeUninit::uninit();
 
         while let Some(xev) = self.event_processor.poll_one_event(&mut xev) {
-            info!("PROCESS XEV {xev:#?}");
             self.event_processor.process_event(xev, app);
         }
     }
@@ -742,12 +740,19 @@ impl ActiveEventLoop {
 
     /// We must choose a window to get the clipboard from or attach it to. Currently choose the
     /// focused window (TODO: better strategy?).
-    fn get_clipboard_window(&self) -> Option<xproto::Window> {
+    pub(crate) fn get_clipboard_window(&self) -> Option<xproto::Window> {
         self.windows
             .borrow()
             .iter()
             .find(|(_, window)| window.upgrade().is_some_and(|window| window.has_focus()))
             .map(|(id, _)| id.into_raw() as _)
+            .or_else(|| {
+                self.windows
+                    .borrow()
+                    .iter()
+                    .find(|(_, window)| window.upgrade().is_some())
+                    .map(|(id, _)| id.into_raw() as _)
+            })
     }
 }
 
@@ -826,7 +831,9 @@ impl RootActiveEventLoop for ActiveEventLoop {
         }
 
         if let Some(clipboard) = data_transfer.resolve_clipboard_type(id) {
-            return Ok(Box::new(data_transfer.get_clipboard(clipboard).get_types()));
+            return Ok(Box::new(
+                data_transfer.get_clipboard(clipboard).get_types(self.x_connection().atoms()),
+            ));
         }
 
         Err(RequestError::Ignored)
@@ -870,8 +877,12 @@ impl RootActiveEventLoop for ActiveEventLoop {
         } else if let Some(clipboard) = data_transfer.resolve_clipboard_type(id) {
             let ty = type_
                 .cast_ref::<SelectionType>()
-                .or_else(|| data_transfer.get_clipboard(clipboard).find_type_by_hint(type_.hint()?))
                 .cloned()
+                .or_else(|| {
+                    data_transfer
+                        .get_clipboard(clipboard)
+                        .find_type_by_hint(type_.hint()?, self.xconn.atoms())
+                })
                 .ok_or(RequestError::NotSupported(NotSupportedError::new("Unknown type hint")))?;
             let Some(clip_win) = self.get_clipboard_window() else {
                 return Err(RequestError::NotSupported(NotSupportedError::new("Unknown window")));
@@ -922,12 +933,8 @@ impl RootActiveEventLoop for ActiveEventLoop {
     }
 
     fn clipboard(&self) -> Result<Option<DataTransferId>, RequestError> {
-        let Some(xwindow) = self.get_clipboard_window() else {
-            return Err(os_error!("no active window").into());
-        };
         let mut data_transfer = self.data_transfer_state.borrow_mut();
-        let serial =
-            data_transfer.request_clipboard_read(xwindow, ClipboardSelectionType::Clipboard);
+        let serial = data_transfer.request_clipboard_read(ClipboardSelectionType::Clipboard);
         Ok(Some(serial))
     }
 

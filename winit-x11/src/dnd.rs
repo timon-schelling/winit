@@ -252,7 +252,17 @@ impl Default for ClipboardState {
 }
 
 impl ClipboardState {
-    pub fn get_types(&self) -> Selection {
+    pub fn get_types(&self, atoms: &Atoms) -> Selection {
+        if let Some(owned_data) = &self.owned_data {
+            let mut accepted: Vec<SelectionType> = Vec::new();
+
+            owned_data.for_each_available_type(&mut |ty| {
+                accepted.extend(SelectionType::from_dyn(atoms, ty));
+                core::ops::ControlFlow::Continue(())
+            });
+
+            return Selection::new(accepted.into());
+        }
         Selection::new(Arc::clone(&self.types))
     }
     /// Adds a request to the fech, returning true if the fetch should start immediately
@@ -260,8 +270,23 @@ impl ClipboardState {
         self.pending_fetch_types.push_back((serial, ty));
         self.pending_fetch_types.len() == 1
     }
-    pub fn find_type_by_hint(&self, hint: TypeHint) -> Option<&SelectionType> {
-        self.types.iter().find(|haystack| haystack.hint() == Some(hint))
+    pub fn find_type_by_hint(&self, hint: TypeHint, atoms: &Atoms) -> Option<SelectionType> {
+        if let Some(owned_data) = &self.owned_data {
+            let mut result = None;
+            owned_data.for_each_available_type(&mut |ty| {
+                if ty.matches(&hint) {
+                    result = SelectionType::from_dyn(atoms, ty).next();
+                }
+                if result.is_some() {
+                    core::ops::ControlFlow::Break(())
+                } else {
+                    core::ops::ControlFlow::Continue(())
+                }
+            });
+            result
+        } else {
+            self.types.iter().find(|haystack| haystack.hint() == Some(hint)).cloned()
+        }
     }
     pub fn clear_owned_data(&mut self) -> bool {
         self.owned_data.take().is_some()
@@ -413,23 +438,23 @@ impl DataTransfer for Selection {
 
 impl DataTransferState {
     pub fn new(xconn: Arc<XConnection>) -> Self {
-        warn!("TODO: Configuring XFIXES doesn't work (possibly issue with dynamic linking)");
         // Listen for selection owner changes for the clipboard. This is a bit hacky but we must
         // know all of the types when the user wants to paste.
-        for item in [crate::dnd::ClipboardSelectionType::Primary] {
-            use x11rb::protocol::xfixes::ConnectionExt as _;
-            let mask = x11rb::protocol::xfixes::SelectionEventMask::SET_SELECTION_OWNER;
+        for item in ClipboardSelectionType::iter() {
+            let mask: u32 = x11rb::protocol::xfixes::SelectionEventMask::SET_SELECTION_OWNER.into();
             let selection = item.to_atom(xconn.atoms());
             let root = xconn.default_root().root;
-            info!(
-                "Configuring XFIXES {root} Selection {selection} mask {}",
-                <x11rb::protocol::xfixes::SelectionEventMask as Into<u32>>::into(mask)
-            );
+            info!("Configuring XFIXES {root} Selection {selection} mask {mask}");
 
-            xconn
-                .xcb_connection()
-                .xfixes_select_selection_input(root, selection, mask)
-                .expect_then_ignore_error("xfixes select selection input");
+            // NOTE: cannot use xcb for unknown reasons?
+            unsafe {
+                (xconn.xfixes.XFixesSelectSelectionInput)(
+                    xconn.display,
+                    root as _,
+                    selection as _,
+                    mask as _,
+                );
+            }
         }
 
         DataTransferState {
@@ -598,7 +623,7 @@ impl DataTransferState {
             warn!("Received request for unknown target clipboard {}", self.xconn.atom_str(prop));
             return false;
         };
-        let Some(clipboard) = &self.get_clipboard(resolved_clipboard).owned_data else {
+        let Some(owned_data) = &self.get_clipboard(resolved_clipboard).owned_data else {
             warn!("Received request for clipboard with no data {:?}", resolved_clipboard);
             return false;
         };
@@ -611,7 +636,7 @@ impl DataTransferState {
             let mut accepted: Vec<xproto::Atom> = vec![atoms[TIMESTAMP] as _, atoms[TARGETS] as _];
 
             // Add user defined types if possible
-            clipboard.for_each_available_type(&mut |ty| {
+            owned_data.for_each_available_type(&mut |ty| {
                 accepted.extend(SelectionType::from_dyn(atoms, ty).map(|ty| ty.atom()));
                 core::ops::ControlFlow::Continue(())
             });
@@ -637,7 +662,7 @@ impl DataTransferState {
             true
         } else {
             let ty = SelectionType::new(atoms, target);
-            let Some(send_data) = clipboard.data_for_type(&ty) else {
+            let Some(send_data) = owned_data.data_for_type(&ty) else {
                 warn!(
                     "Selection request for unknown selection target {}",
                     self.xconn.atom_str(target)
@@ -861,19 +886,22 @@ impl DataTransferState {
         self.get_clipboard_mut(clipboard).types = targets.into();
     }
 
-    pub fn request_clipboard_read(
-        &mut self,
-        xwindow: xproto::Window,
+    pub fn request_updated_targets(
+        &self,
         clipboard: ClipboardSelectionType,
-    ) -> DataTransferId {
+        xwindow: xproto::Window,
+    ) {
+        let atoms = self.xconn.atoms();
+        // Request a list of targets
+        self.convert_selection(xwindow, clipboard.to_atom(atoms), atoms[TARGETS], 42);
+        info!("Requested updated version to {xwindow}");
+    }
+
+    pub fn request_clipboard_read(&mut self, clipboard: ClipboardSelectionType) -> DataTransferId {
         let clipboard_state = self.get_clipboard(clipboard);
         if let Some(_data) = &clipboard_state.owned_data {
             info!("Clipboard is owned by current application. TODO: skip X11 protocol");
         }
-
-        let atoms = self.xconn.atoms();
-        // Request a list of targets
-        self.convert_selection(xwindow, clipboard.to_atom(atoms), atoms[TARGETS], 42);
 
         clipboard_state.clipboard_serial
     }

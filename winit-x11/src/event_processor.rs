@@ -16,6 +16,7 @@ use winit_core::event::{
 use winit_core::event_loop::DndAction;
 use winit_core::keyboard::ModifiersState;
 use winit_core::window::WindowId;
+use x11_dl::xfixes::XFixesSelectionNotifyEvent;
 use x11_dl::xinput2::{
     self, XIDeviceEvent, XIEnterEvent, XIFocusInEvent, XIFocusOutEvent, XIHierarchyEvent,
     XILeaveEvent, XIModifierState, XIRawEvent,
@@ -293,8 +294,9 @@ impl EventProcessor {
                     self.process_dpi_change(app);
                 }
                 if event_type == self.xfixesext.first_event as _ {
-                    // let xev: &XkbAnyEvent = unsafe { &*(xev as *const _ as *const XkbAnyEvent) };
-                    info!("XFIXES EVENT");
+                    let xev: &XFixesSelectionNotifyEvent =
+                        unsafe { &*(xev as *const _ as *const XFixesSelectionNotifyEvent) };
+                    self.xfixes_selection_notify(xev);
                 }
             },
         }
@@ -648,13 +650,26 @@ impl EventProcessor {
         if xev.selection == atoms[XdndSelection] as c_ulong {
             self.selection_notify_dnd(app, xev);
         } else if ClipboardSelectionType::from_atom(atoms, xev.selection as _).is_some() {
-            self.selection_notify_clip(app,xev);
+            self.selection_notify_clip(app, xev);
         } else {
             warn!(
                 "Selection notify for unknown selection property {}",
                 self.target.x_connection().atom_str(xev.property as _)
             );
         }
+    }
+
+    fn xfixes_selection_notify(&mut self, xev: &XFixesSelectionNotifyEvent) {
+        let Some(clipboard) = ClipboardSelectionType::from_atom(
+            self.target.x_connection().atoms(),
+            xev.selection as _,
+        ) else {
+            return;
+        };
+
+        let Some(window) = self.target.get_clipboard_window() else { return };
+        let data_transfer = self.target.data_transfer_state.borrow();
+        data_transfer.request_updated_targets(clipboard, window);
     }
 
     /// Handles the X11 `SelectionClear` which occurs when we used to own a selection but now do not

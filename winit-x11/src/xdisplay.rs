@@ -23,6 +23,8 @@ use crate::event_loop::X11Error;
 pub struct XConnection {
     pub xlib: ffi::Xlib,
 
+    pub xfixes: ffi::xfixes::Xlib,
+
     // TODO(notgull): I'd like to remove this, but apparently Xlib and Xinput2 are tied together
     // for some reason.
     pub xinput2: ffi::XInput2,
@@ -82,6 +84,7 @@ impl XConnection {
     pub fn new(error_handler: XErrorHandler) -> Result<XConnection, XNotSupported> {
         // opening the libraries
         let xlib = ffi::Xlib::open()?;
+        let xfixes = ffi::xfixes::Xlib::open()?;
         let xlib_xcb = ffi::Xlib_xcb::open()?;
         let xinput2 = ffi::XInput2::open()?;
 
@@ -146,6 +149,7 @@ impl XConnection {
 
         Ok(XConnection {
             xlib,
+            xfixes,
             xinput2,
             display,
             xcb: Some(xcb),
