@@ -36,7 +36,7 @@ use x11rb::x11_utils::{ExtensionInformation, Serialize};
 use xkbcommon_dl::xkb_mod_mask_t;
 
 use crate::atoms::*;
-use crate::dnd::{ClipboardSelectionType, DndState, SelectionType};
+use crate::data_transfer::{ClipboardSelectionType, DndState, SelectionType};
 use crate::event_loop::{
     ALL_DEVICES, ActiveEventLoop, CookieResultExt, Device, DeviceInfo, DeviceType,
     ScrollOrientation, mkdid, mkwid,
@@ -628,7 +628,6 @@ impl EventProcessor {
             xproto::EventMask::PROPERTY_CHANGE,
             notify,
         );
-        info!("Sending property change to dest {}", xev.requestor);
         if let Err(err) = result {
             warn!(
                 "Got error when sending property change event for {}: {}",
@@ -667,9 +666,15 @@ impl EventProcessor {
             return;
         };
 
+        // If the selection is not owned then clear
+        if xev.owner == 0 {
+            self.target.data_transfer_state.borrow_mut().clear_clipboard(clipboard);
+            return;
+        }
+
         let Some(window) = self.target.get_clipboard_window() else { return };
-        let data_transfer = self.target.data_transfer_state.borrow();
-        data_transfer.request_updated_targets(clipboard, window);
+        let mut data_transfer = self.target.data_transfer_state.borrow_mut();
+        data_transfer.request_updated_targets(clipboard, window, xev.selection_timestamp);
     }
 
     /// Handles the X11 `SelectionClear` which occurs when we used to own a selection but now do not
@@ -679,9 +684,7 @@ impl EventProcessor {
             return;
         };
         let mut data_transfer = self.target.data_transfer_state.borrow_mut();
-        if data_transfer.get_clipboard_mut(clipboard).clear_owned_data() {
-            info!("Cleared owned data for {clipboard:?}");
-        }
+        data_transfer.clear_clipboard(clipboard);
     }
 
     fn selection_notify_dnd(&mut self, app: &mut dyn ApplicationHandler, xev: &XSelectionEvent) {
@@ -750,10 +753,10 @@ impl EventProcessor {
             value,
         });
 
-        let dnd = self.target.data_transfer_state.borrow();
+        let data_transfer = self.target.data_transfer_state.borrow();
 
         // If we have another fetch pending, request it from the drag source window
-        if let Some((window, type_)) = dnd.state().and_then(|state| {
+        if let Some((window, type_)) = data_transfer.state().and_then(|state| {
             state
                 .pending_fetch_types
                 .front()
@@ -763,12 +766,16 @@ impl EventProcessor {
             let selection = self.target.xconn.atoms()[XdndSelection];
             // TODO: The result is stored into a property named XdndSelection. Consider using a
             // different name to avoid conflict.
-            dnd.convert_selection(window, selection, type_.atom(), selection);
+            self.target
+                .xconn
+                .convert_selection(window, selection, type_.atom(), selection)
+                .expect("convert selection");
         } else if let Some((this_window, target_window)) =
-            dnd.state().and_then(|state| state.finished)
+            data_transfer.state().and_then(|state| state.finished)
         {
             unsafe {
-                dnd.send_finished(this_window, target_window)
+                data_transfer
+                    .send_finished(this_window, target_window)
                     .expect("Failed to send `XdndFinished` message.");
             }
         }
@@ -779,11 +786,23 @@ impl EventProcessor {
         let xwindow = xev.requestor as xproto::Window;
         let property = xev.property as xproto::Atom;
 
+        // If we get a request for a window which is not ours then skip
         if !self.window_exists(xwindow) {
             return;
         }
 
-        info!("Data recieved from another process (SelectionNotify)");
+        // If we get a target that is not one of our known clipboards the skip
+        let Some(clipboard) = ClipboardSelectionType::from_atom(
+            self.target.x_connection().atoms(),
+            xev.selection as _,
+        ) else {
+            return;
+        };
+
+        // If we get a none property then skip
+        if xev.property as xproto::Atom == xproto::AtomEnum::NONE.into() {
+            return;
+        }
 
         let con = self.target.x_connection();
         let atoms = con.atoms();
@@ -793,12 +812,15 @@ impl EventProcessor {
         let property_ty = match con.get_dynamic_property(property, xwindow, &mut property_value) {
             Ok((property_ty, _)) => property_ty,
             Err(e) => {
-                error!("Unable to read property on notify clip: {e}");
+                error!(
+                    "Unable to read property {} on notify clip for selection {clipboard:?}: {e}",
+                    self.target.xconn.atom_str(property)
+                );
                 return;
             },
         };
         // // Exit now if using incr
-        if property_ty == con.atoms()[INCR].into() {
+        if property_ty == atoms[INCR].into() {
             data_transfer.start_incr_receiver(xev);
             return;
         }
@@ -807,14 +829,10 @@ impl EventProcessor {
             || xev.target as xproto::Atom == xproto::AtomEnum::ATOM.into()
         {
             data_transfer.populate_targets(xev.selection as _, property_value);
-        } else if let Some(clipboard) =
-            ClipboardSelectionType::from_atom(con.atoms(), xev.selection as _)
+        } else if let Some(data) =
+            data_transfer.send_clipboard_data(xwindow, clipboard, property_value)
         {
-            if let Some(data) =
-                data_transfer.send_clipboard_data(xwindow, clipboard, property_value)
-            {
-                app.window_event(&self.target, data.window(), data.to_event());
-            }
+            app.window_event(&self.target, data.window(), data.to_event());
         }
     }
 

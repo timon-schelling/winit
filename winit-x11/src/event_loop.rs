@@ -37,18 +37,17 @@ use x11rb::protocol::{xkb, xproto};
 use x11rb::x11_utils::X11Error as LogicalError;
 use x11rb::xcb_ffi::ReplyOrIdError;
 
-use crate::atoms::AtomName::XdndSelection;
 use crate::atoms::{
     _NET_WM_PING, _NET_WM_SYNC_REQUEST, ABS_PRESSURE, ABS_TILT_X, ABS_TILT_Y, ABS_X, ABS_Y, Atoms,
     WM_DELETE_WINDOW,
 };
-use crate::dnd::{ClipboardSelectionType, DataTransferState};
+use crate::data_transfer::{ClipboardSelectionType, DataTransferState};
 use crate::event_processor::{EventProcessor, MAX_MOD_REPLAY_LEN};
 use crate::ime::{self, Ime, ImeCreationError, ImeSender};
 use crate::util::{self, CustomCursor};
 use crate::window::{UnownedWindow, Window};
 use crate::xdisplay::{XConnection, XError, XNotSupported};
-use crate::{Selection, SelectionType, XlibErrorHook, ffi, xsettings};
+use crate::{Selection, XlibErrorHook, ffi, xsettings};
 
 // Xinput constants not defined in x11rb
 pub(crate) const ALL_DEVICES: u16 = 0;
@@ -846,70 +845,18 @@ impl RootActiveEventLoop for ActiveEventLoop {
     ) -> Result<AsyncRequestSerial, RequestError> {
         let mut data_transfer = self.data_transfer_state.borrow_mut();
 
-        let serial = AsyncRequestSerial::get();
-
-        let new_convert_selection = if let Some(state) = data_transfer.state()
+        if let Some(state) = data_transfer.state()
             && state.transfer_id == id
         {
-            let type_ = type_
-                .cast_ref::<SelectionType>()
-                .or_else(|| data_transfer.find_type_by_hint(type_.hint()?))
-                .cloned()
-                .ok_or(RequestError::NotSupported(NotSupportedError::new("Unknown type hint")))?;
-
-            let Some(state) = data_transfer.state_mut() else {
-                return Err(RequestError::Ignored);
-            };
-
-            if state.transfer_id != id {}
-
-            // If it's non-empty, assume that we're still waiting on some other fetch operation.
-            // The `SelectionNotify` handler will send a new `convert_selection` event if any
-            // more are on the stack.
-            let should_emit_convert_selection = state.pending_fetch_types.is_empty();
-
-            let atom = type_.atom();
-
-            state.pending_fetch_types.push_back((serial, type_));
-
-            let selection = self.xconn.atoms()[XdndSelection];
-            should_emit_convert_selection.then_some((state.target_window, selection, atom))
+            data_transfer.fetch_dnd_data_transfer(type_)
         } else if let Some(clipboard) = data_transfer.resolve_clipboard_type(id) {
-            let ty = type_
-                .cast_ref::<SelectionType>()
-                .cloned()
-                .or_else(|| {
-                    data_transfer
-                        .get_clipboard(clipboard)
-                        .find_type_by_hint(type_.hint()?, self.xconn.atoms())
-                })
-                .ok_or(RequestError::NotSupported(NotSupportedError::new("Unknown type hint")))?;
             let Some(clip_win) = self.get_clipboard_window() else {
                 return Err(RequestError::NotSupported(NotSupportedError::new("Unknown window")));
             };
-            let reading_atom = ty.atom();
-            let reading_name = self.x_connection().atom_str(reading_atom);
-            info!("We have chosen to try and read property {reading_name}");
-
-            let should_emit_convert_selection =
-                data_transfer.get_clipboard_mut(clipboard).add_to_fetch(serial, ty);
-
-            should_emit_convert_selection.then_some((
-                clip_win,
-                clipboard.to_atom(self.xconn.atoms()),
-                reading_atom,
-            ))
+            data_transfer.fetch_clipboard_data_transfer(clipboard, type_, clip_win)
         } else {
-            None
-        };
-
-        if let Some((window, selection, target)) = new_convert_selection {
-            data_transfer.convert_selection(window, selection, target, selection);
-        };
-        // TODO: The result is stored into a property with the same name as the selection. Consider
-        // using a different name to avoid conflict.
-
-        Ok(serial)
+            Err(RequestError::Ignored)
+        }
     }
 
     fn set_valid_dnd_actions(

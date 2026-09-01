@@ -135,12 +135,12 @@ impl XConnection {
 
             // Check if we have reached the end
             if reply.bytes_after == 0 {
-                info!(
+                trace!(
                     "Read {} into property {} data {}",
                     self.atom_str(reply.type_),
                     self.atom_str(property),
-                    if result.len() < 100 {
-                        format!("{result:?}")
+                    if reply.value.len() < 100 {
+                        format!("{:?}", reply.value)
                     } else {
                         "[... many bytes]".to_string()
                     }
