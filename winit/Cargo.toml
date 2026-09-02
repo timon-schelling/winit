@@ -39,8 +39,7 @@ targets = [
 
 # Features are documented in either `lib.rs` or under `winit::platform`.
 [features]
-# TODO: Revert and possibly test on X11 proper not just XWayland
-default = ["x11"]
+default = ["x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita"]
 
 android-game-activity = ["winit-android/game-activity"]
 android-native-activity = ["winit-android/native-activity"]
